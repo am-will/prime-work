@@ -101,6 +101,9 @@ export default function App() {
 
   useEffect(() => { void refreshGit(); return () => { gitRequestRef.current += 1 } }, [refreshGit])
   useEffect(() => {
+    if (activeSession?.syncRevision) void refreshGit()
+  }, [activeSession?.syncRevision, refreshGit])
+  useEffect(() => {
     if (!bridge) return
     let cancelled = false
     const projectPath = activeProject?.primaryFolder && !activeProject.inferred ? activeProject.primaryFolder : undefined
@@ -236,7 +239,15 @@ export default function App() {
         let startedRuntime = false
         if (!activeRuntime) {
           workspace.attachRuntime(undefined, generation)
-          activeRuntime = await bridge.agent.start({ cwd: selected.cwd, sessionPath: selected.sessionFile, model: model === 'auto' ? undefined : model, thinking: effort })
+          const selectedSession = selected.sessionFile ? sessions.find((session) => session.filePath === selected.sessionFile) : undefined
+          if (selected.sessionFile && selectedSession?.status === 'running'
+            && await bridge.sessions.followUp(selected.sessionFile, prompt)) return
+          try {
+            activeRuntime = await bridge.agent.start({ cwd: selected.cwd, sessionPath: selected.sessionFile, model: model === 'auto' ? undefined : model, thinking: effort })
+          } catch (startError) {
+            if (selected.sessionFile && await bridge.sessions.followUp(selected.sessionFile, prompt)) return
+            throw startError
+          }
           startedRuntime = true
           if (workspace.workspaceRef.current.generation !== generation) { await bridge.agent.stop(activeRuntime.runtimeId).catch(() => false); return }
         }
@@ -343,7 +354,7 @@ export default function App() {
       <div className="workbench__content">{view === 'session' ? <div ref={layout.sessionWorkspaceRef} className="session-workspace" style={{ '--inspector-width': `${layout.inspectorWidth}px`, '--terminal-height': `${layout.terminalHeight}px` } as CSSProperties}>
         <div ref={layout.workspaceRowRef} className="workspace-row">
           <main className="conversation-pane">
-            <Transcript key={workspace.activeSessionId ?? 'new-session'} messages={workspace.messages} git={git} loading={workspace.loadingSession} showReasoning={settingsState.settings.showReasoningSummaries} showTools={settingsState.settings.showToolCalls} onOpenChanges={openChanges} onSuggestion={(prompt) => void sendPrompt(prompt)} suggestionsDisabled={!activeProject || workspace.loadingSession || submitting} />
+            <Transcript key={workspace.activeSessionId ?? 'new-session'} messages={workspace.messages} git={git} loading={workspace.loadingSession} active={busy || activeSession?.status === 'running'} showReasoning={settingsState.settings.showReasoningSummaries} showTools={settingsState.settings.showToolCalls} onOpenChanges={openChanges} onSuggestion={(prompt) => void sendPrompt(prompt)} suggestionsDisabled={!activeProject || workspace.loadingSession || submitting} />
             <Composer key={workspace.activeSessionId ? `${activeProject?.id ?? 'no-project'}:${workspace.activeSessionId}` : `${activeProject?.id ?? 'no-project'}:new:${workspace.workspaceGeneration}`} busy={busy} submitting={submitting} loading={workspace.loadingSession} disabled={!activeProject} model={model} effort={effort} skills={skills} onModelChange={setModel} onEffortChange={setEffort} onSend={sendPrompt} onStop={stopRuntime} />
           </main>
           {settingsState.inspectorOpen ? <ResizeHandle orientation="vertical" label="Resize inspector" value={layout.inspectorWidth} min={INSPECTOR_MIN} max={layout.inspectorMax} defaultValue={INSPECTOR_DEFAULT} onChange={layout.setInspectorWidth} /> : null}

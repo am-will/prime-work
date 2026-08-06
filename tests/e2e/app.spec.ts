@@ -1,11 +1,14 @@
 import { test, expect, _electron as electron, type ElectronApplication, type Page } from '@playwright/test'
-import { chmodSync, mkdirSync, mkdtempSync, realpathSync, rmSync, writeFileSync } from 'node:fs'
+import { appendFileSync, chmodSync, existsSync, mkdirSync, mkdtempSync, readFileSync, realpathSync, rmSync, writeFileSync } from 'node:fs'
+import { createServer, type Server } from 'node:net'
 import { tmpdir } from 'node:os'
 import { join } from 'node:path'
 
 let app: ElectronApplication
 let page: Page
 let fixtureRoot = ''
+let fixtureSessionFile = ''
+let daemonServer: Server | null = null
 let actionableErrors: string[] = []
 
 const attachDiagnostics = (target: Page) => {
@@ -15,7 +18,7 @@ const attachDiagnostics = (target: Page) => {
   })
 }
 
-function createHermeticFixture(): { userData: string; home: string; project: string; executable: string } {
+function createHermeticFixture(activeSession = false): { userData: string; home: string; project: string; executable: string; sessionFile: string } {
   fixtureRoot = mkdtempSync(join(tmpdir(), 'prime-work-e2e-'))
   const userData = join(fixtureRoot, 'user-data')
   const home = join(fixtureRoot, 'home')
@@ -61,6 +64,17 @@ if (args.includes('--version')) { process.stdout.write('prime-agent 0.7.0\\n'); 
 if (args[0] === 'schedule') { process.stdout.write(JSON.stringify({ jobs: [] }) + '\\n'); process.exit(0) }
 const resumeIndex = args.indexOf('--resume')
 const sessionFile = resumeIndex >= 0 ? args[resumeIndex + 1] : ${JSON.stringify(sessionFile)}
+if (args[0] === 'list') {
+  const sessions = ${JSON.stringify(activeSession)}
+    ? [{ id: 'active-fixture', activeSessionId: 'active-fixture', lifecycle: 'live', isSessionActive: true, activity: 'working', isStreaming: true, sessionFile, modified: new Date().toISOString() }]
+    : []
+  process.stdout.write(JSON.stringify({ sessions }) + '\\n')
+  process.exit(0)
+}
+if (args[0] === 'status') {
+  process.stdout.write(JSON.stringify([{ status: 'current', isDefault: true, socketPath: ${JSON.stringify(join(fixtureRoot, 'daemon.sock'))} }]) + '\\n')
+  process.exit(0)
+}
 const send = (value) => process.stdout.write(JSON.stringify(value) + '\\n')
 let pendingPrompt
 readline.createInterface({ input: process.stdin }).on('line', (line) => {
@@ -94,7 +108,48 @@ readline.createInterface({ input: process.stdin }).on('line', (line) => {
 })
 `)
   chmodSync(executable, 0o755)
-  return { userData, home, project, executable }
+  return { userData, home, project, executable, sessionFile }
+}
+
+async function startFixtureDaemon(sessionFile: string): Promise<void> {
+  const socketPath = join(fixtureRoot, 'daemon.sock')
+  daemonServer = createServer((socket) => {
+    let buffered = ''
+    socket.write(`${JSON.stringify({
+      type: 'daemon_hello',
+      protocol: { name: 'prime-agent.daemon', version: 7 },
+      serverCapabilities: ['session_input_admission'],
+    })}\n`)
+    socket.on('data', (chunk) => {
+      buffered += chunk.toString('utf8')
+      let newline = buffered.indexOf('\n')
+      while (newline >= 0) {
+        const line = buffered.slice(0, newline)
+        buffered = buffered.slice(newline + 1)
+        newline = buffered.indexOf('\n')
+        if (!line) continue
+        const envelope = JSON.parse(line) as { id?: string; command?: { type?: string; activeSessionId?: string; message?: string; commandId?: string } }
+        if (envelope.command?.type === 'follow_up') {
+          writeFileSync(join(fixtureRoot, 'follow-up-command.json'), JSON.stringify(envelope.command))
+          const timestamp = new Date().toISOString()
+          appendFileSync(sessionFile, [
+            JSON.stringify({ type: 'message', id: 'fixture-external-user', parentId: 'fixture-goal-summary', timestamp, message: { role: 'user', content: envelope.command.message } }),
+            JSON.stringify({ type: 'message', id: 'fixture-external-assistant', parentId: 'fixture-external-user', timestamp, message: { role: 'assistant', content: 'The external Prime Agent received the queued reply.' } }),
+          ].join('\n') + '\n')
+          socket.write(`${JSON.stringify({ type: 'response', id: envelope.id, command: 'follow_up', success: true, data: { queued: true } })}\n`)
+        } else if (envelope.command?.type === 'ack_result') {
+          writeFileSync(join(fixtureRoot, 'follow-up-ack.json'), JSON.stringify(envelope.command))
+        }
+      }
+    })
+  })
+  await new Promise<void>((resolveListen, rejectListen) => {
+    daemonServer!.once('error', rejectListen)
+    daemonServer!.listen(socketPath, () => {
+      daemonServer!.off('error', rejectListen)
+      resolveListen()
+    })
+  })
 }
 
 function hermeticEnvironment(home: string, executable: string): NodeJS.ProcessEnv {
@@ -113,9 +168,15 @@ function hermeticEnvironment(home: string, executable: string): NodeJS.ProcessEn
 }
 
 test.describe('Prime Work desktop smoke', () => {
-  test.beforeEach(async () => {
+  test.beforeEach(async ({}, testInfo) => {
     actionableErrors = []
-    const fixture = createHermeticFixture()
+    const activeSession = testInfo.title === 'queues a reply to a session that is active outside Prime Work'
+      || testInfo.title === 'reflects an external JSONL append without reselecting the live session'
+    const fixture = createHermeticFixture(activeSession)
+    fixtureSessionFile = fixture.sessionFile
+    if (testInfo.title === 'queues a reply to a session that is active outside Prime Work') {
+      await startFixtureDaemon(fixture.sessionFile)
+    }
     app = await electron.launch({ args: ['.', `--user-data-dir=${fixture.userData}`], cwd: process.cwd(), env: hermeticEnvironment(fixture.home, fixture.executable) })
     page = await app.firstWindow()
     attachDiagnostics(page)
@@ -125,8 +186,11 @@ test.describe('Prime Work desktop smoke', () => {
 
   test.afterEach(async () => {
     await app?.close().catch(() => undefined)
+    if (daemonServer) await new Promise<void>((resolveClose) => daemonServer!.close(() => resolveClose()))
+    daemonServer = null
     if (fixtureRoot) rmSync(fixtureRoot, { recursive: true, force: true })
     fixtureRoot = ''
+    fixtureSessionFile = ''
   })
 
   test('loads the sandboxed preload bridge and hermetic service data', async () => {
@@ -140,6 +204,58 @@ test.describe('Prime Work desktop smoke', () => {
     await expect(page.locator('.sidebar__brand small')).toHaveText('Work')
     await expect(page.locator('.sidebar__brand .prime-mark svg path')).toHaveCount(2)
     await expect(page.locator('.prime-mark img')).toHaveCount(0)
+  })
+
+  test('queues a reply to a session that is active outside Prime Work', async () => {
+    const composer = page.getByRole('combobox', { name: 'Message Prime' })
+    await composer.fill('Queue this follow-up from Prime Work')
+    await composer.press('Enter')
+
+    const commandMarker = join(fixtureRoot, 'follow-up-command.json')
+    await expect.poll(() => existsSync(commandMarker)).toBe(true)
+    expect(JSON.parse(readFileSync(commandMarker, 'utf8'))).toMatchObject({
+      type: 'follow_up',
+      activeSessionId: 'active-fixture',
+      message: 'Queue this follow-up from Prime Work',
+    })
+    const ackMarker = join(fixtureRoot, 'follow-up-ack.json')
+    await expect.poll(() => existsSync(ackMarker)).toBe(true)
+    expect(JSON.parse(readFileSync(ackMarker, 'utf8'))).toMatchObject({ type: 'ack_result' })
+    await expect(page.locator('.transcript').getByText('The external Prime Agent received the queued reply.')).toBeVisible()
+    await expect(page.getByText(/Prime Agent RPC exited|Request failed/)).toHaveCount(0)
+  })
+
+  test('reflects an external JSONL append without reselecting the live session', async () => {
+    await expect(page.locator('.transcript').getByText('Hermetic desktop fixture', { exact: true })).toBeVisible()
+    const selectedSession = page.locator('.session-row-wrap.is-selected')
+    await expect(selectedSession).toHaveCount(1)
+
+    const nonce = `${Date.now()}-${Math.random().toString(36).slice(2)}`
+    const reasoning = `External live reasoning ${nonce}`
+    const answer = `External live answer ${nonce}`
+    const timestamp = new Date().toISOString()
+    appendFileSync(fixtureSessionFile, `${JSON.stringify({
+      type: 'message',
+      id: `fixture-external-${nonce}`,
+      parentId: 'fixture-goal-summary',
+      timestamp,
+      message: {
+        role: 'assistant',
+        timestamp,
+        content: [
+          { type: 'thinking', thinking: reasoning },
+          { type: 'toolCall', id: `fixture-tool-${nonce}`, name: 'fixture_external_tool', arguments: { nonce } },
+          { type: 'text', text: answer },
+        ],
+      },
+    })}
+`)
+
+    await expect(page.locator('.transcript').getByText(reasoning, { exact: true })).toHaveCount(1)
+    await expect(page.locator('.transcript').getByText(answer, { exact: true })).toHaveCount(1)
+    await expect(page.locator('.activity-line--tool')).toContainText('fixture_external_tool')
+    await expect(page.locator('.work-disclosure__button')).toHaveCount(0)
+    await expect(selectedSession).toHaveCount(1)
   })
 
   test('keeps session options visible and starts a new session from a hovered project', async () => {
@@ -347,14 +463,21 @@ test.describe('Prime Work desktop smoke', () => {
     await expect(completedRow).not.toHaveClass(/has-attention/)
   })
 
-  test('rolls back a rejected optimistic setting', async () => {
+  test('validates a rejected terminal shell draft without overwriting the committed setting', async () => {
     await page.keyboard.press('Meta+,')
     await page.getByRole('button', { name: 'Terminal', exact: true }).first().click()
     const shell = page.locator('.settings-content input.mono')
     await expect(shell).toHaveValue('/bin/zsh')
     await shell.fill('/definitely/not-an-executable')
+    await expect(page.getByRole('button', { name: 'Save', exact: true })).toBeEnabled()
+    await page.getByRole('button', { name: 'Save', exact: true }).click()
     await expect(page.locator('.toast')).toContainText(/shell is not executable/i)
-    await expect(shell).toHaveValue('/bin/zsh')
+    await expect(shell).toHaveAttribute('aria-invalid', 'true')
+    await expect(page.getByRole('alert')).toContainText('The setting could not be saved.')
+    await expect(shell).toHaveValue('/definitely/not-an-executable')
+    await page.getByRole('button', { name: 'General', exact: true }).click()
+    await page.getByRole('button', { name: 'Terminal', exact: true }).first().click()
+    await expect(page.locator('.settings-content input.mono')).toHaveValue('/bin/zsh')
   })
 
   test('uses overlay panels at the compact desktop breakpoint', async () => {

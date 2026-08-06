@@ -142,17 +142,20 @@ export function useWorkspaceRuntime({
     selected: WorkspaceSnapshot,
     reconciliation: boolean,
     runtimeId?: string,
-  ) => {
+  ): TranscriptLoad | undefined => {
     if (!bridge || !selected.sessionFile) return
+    const previousLoad = transcriptLoadRef.current
     const pendingLoad: TranscriptLoad = {
       generation: selected.generation,
       sessionFile: selected.sessionFile,
-      eventBuffer: createPrimeEventBuffer(),
+      eventBuffer: previousLoad?.generation === selected.generation
+        && previousLoad.sessionFile === selected.sessionFile
+        ? previousLoad.eventBuffer
+        : createPrimeEventBuffer(),
       runtimeId,
       reconciliation,
     }
     transcriptLoadRef.current = pendingLoad
-    if (!reconciliation) setLoadingSession(true)
 
     void bridge.sessions.read(selected.sessionFile).then((value) => {
       if (transcriptLoadRef.current !== pendingLoad) return
@@ -176,12 +179,11 @@ export function useWorkspaceRuntime({
       setMessages((messages) => pendingLoad.eventBuffer.replay(messages))
       reportError(error)
     }).finally(() => {
-      if (transcriptLoadRef.current === pendingLoad) transcriptLoadRef.current = null
-      if (workspaceRef.current.generation === pendingLoad.generation && !pendingLoad.reconciliation) {
-        setLoadingSession(false)
-      }
+      if (transcriptLoadRef.current !== pendingLoad) return
+      transcriptLoadRef.current = null
+      if (!pendingLoad.reconciliation) setLoadingSession(false)
       const deferred = deferredReconciliationRef.current
-      if (!deferred || transcriptLoadRef.current) return
+      if (!deferred) return
       deferredReconciliationRef.current = null
       const current = workspaceRef.current
       if (reconciliationMatches(deferred, current.generation, deferred.runtimeId, current.sessionFile)) {
@@ -189,6 +191,7 @@ export function useWorkspaceRuntime({
         startTranscriptRead(current, true, deferred.runtimeId)
       }
     })
+    return pendingLoad
   }, [bridge, flushAgentEvents, reportError])
 
   const reconcileTranscriptForEvent = useCallback((runtimeId: string, event: Record<string, unknown>) => {
@@ -226,43 +229,11 @@ export function useWorkspaceRuntime({
     }
     const selected = workspaceRef.current
     if (selected.generation !== workspaceGeneration || selected.sessionFile !== activeSession.filePath) return
-    const currentLoad = transcriptLoadRef.current
-    if (currentLoad?.generation === workspaceGeneration && currentLoad.sessionFile === activeSession.filePath) {
-      if (!currentLoad.reconciliation) {
-        // activateWorkspace synchronously installs the buffer before this effect can run.
-        void bridge.sessions.read(activeSession.filePath).then((value) => {
-          if (transcriptLoadRef.current !== currentLoad || workspaceRef.current.generation !== currentLoad.generation) return
-          transcriptLoadRef.current = null
-          setMessages(currentLoad.eventBuffer.replay(value))
-        }).catch((error) => {
-          if (transcriptLoadRef.current === currentLoad && workspaceRef.current.generation === currentLoad.generation) {
-            transcriptLoadRef.current = null
-            setMessages((messages) => currentLoad.eventBuffer.replay(messages))
-            reportError(error)
-          }
-        }).finally(() => {
-          if (workspaceRef.current.generation === currentLoad.generation) setLoadingSession(false)
-          const deferred = deferredReconciliationRef.current
-          if (deferred && !transcriptLoadRef.current) {
-            deferredReconciliationRef.current = null
-            const current = workspaceRef.current
-            if (reconciliationMatches(deferred, current.generation, deferred.runtimeId, current.sessionFile)) {
-              flushAgentEvents()
-              startTranscriptRead(current, true, deferred.runtimeId)
-            }
-          }
-        })
-      }
-      return
-    }
     startTranscriptRead(selected, false)
-    return () => {
-      const load = transcriptLoadRef.current
-      if (load?.generation === selected.generation && !load.reconciliation) transcriptLoadRef.current = null
-    }
-  }, [activeSession?.filePath, bridge, flushAgentEvents, reportError, startTranscriptRead, workspaceGeneration])
+  }, [activeSession?.filePath, activeSession?.syncRevision, activeSession?.updatedAt, bridge, startTranscriptRead, workspaceGeneration])
 
   useEffect(() => () => {
+    transcriptLoadRef.current = null
     if (agentEventFrameRef.current !== null) cancelAnimationFrame(agentEventFrameRef.current)
   }, [])
 

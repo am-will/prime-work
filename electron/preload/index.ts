@@ -1,5 +1,5 @@
 import { contextBridge, ipcRenderer } from 'electron'
-import type { PrimeEventEnvelope, PrimeWorkApi, TerminalDataEvent, TerminalExitEvent } from '../../src/types/api'
+import type { PrimeEventEnvelope, PrimeWorkApi, SessionChangeEvent, TerminalDataEvent, TerminalExitEvent } from '../../src/types/api'
 
 function subscribe<T>(channel: string, callback: (payload: T) => void): () => void {
   if (typeof callback !== 'function') throw new TypeError('callback must be a function')
@@ -27,8 +27,10 @@ const api: PrimeWorkApi = {
   sessions: {
     list: (projectPath, includeArchived) => ipcRenderer.invoke('sessions:list', projectPath, includeArchived),
     read: (filePath) => ipcRenderer.invoke('sessions:read', filePath),
+    followUp: (filePath, message) => ipcRenderer.invoke('sessions:follow-up', filePath, message),
     rename: (filePath, title) => ipcRenderer.invoke('sessions:rename', filePath, title),
     archive: (filePath, archived) => ipcRenderer.invoke('sessions:archive', filePath, archived),
+    onChanged: (callback) => subscribe<SessionChangeEvent>('sessions:changed', callback),
   },
   agent: {
     start: (options) => ipcRenderer.invoke('agent:start', options),

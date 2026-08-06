@@ -1,6 +1,6 @@
 import type { Stats } from 'node:fs'
 import { readdir, realpath, stat } from 'node:fs/promises'
-import { join, resolve } from 'node:path'
+import { isAbsolute, join } from 'node:path'
 import { runProcess } from '../process-utils'
 import { isPathWithin, isRecord } from '../validation'
 import { applyLiveMetadata, type JsonRecord, type SessionMetadata } from './metadata'
@@ -25,9 +25,10 @@ async function mapLimit<T, U>(values: readonly T[], limit: number, mapper: (valu
 }
 
 export class SessionMetadataCatalog {
-  private catalogCache: { expiresAt: number; sessions: Map<string, JsonRecord> } | null = null
-  private catalogRequest: Promise<Map<string, JsonRecord>> | null = null
-  private sessionScanRequest: Promise<SessionMetadata[]> | null = null
+  private catalogCache: { expiresAt: number; revision: number; sessions: Map<string, JsonRecord> } | null = null
+  private catalogRequest: { revision: number; promise: Promise<Map<string, JsonRecord>> } | null = null
+  private catalogRevision = 0
+  private sessionScanRequest: { revision: number; promise: Promise<SessionMetadata[]> } | null = null
   private readonly metadataCache = new Map<string, SessionMetadata>()
   private readonly metadataRequests = new Map<string, Promise<SessionMetadata>>()
 
@@ -38,16 +39,22 @@ export class SessionMetadataCatalog {
     private readonly readMetadata: (filePath: string, knownStat?: Stats) => Promise<SessionMetadata>,
   ) {}
 
+  invalidateLiveCatalog(): void {
+    this.catalogRevision += 1
+    this.catalogCache = null
+  }
+
   async all(): Promise<SessionMetadata[]> {
-    if (this.sessionScanRequest) return this.sessionScanRequest
-    const request = this.scan()
+    const revision = this.catalogRevision
+    if (this.sessionScanRequest?.revision === revision) return this.sessionScanRequest.promise
+    const request = { revision, promise: this.scan(revision) }
     this.sessionScanRequest = request
-    try { return await request } finally {
+    try { return await request.promise } finally {
       if (this.sessionScanRequest === request) this.sessionScanRequest = null
     }
   }
 
-  private async scan(): Promise<SessionMetadata[]> {
+  private async scan(revision: number): Promise<SessionMetadata[]> {
     let names: string[]
     let root: string
     try {
@@ -71,25 +78,27 @@ export class SessionMetadataCatalog {
     const selected = [...byCanonicalPath.values()]
       .sort((a, b) => b.fileStat.mtimeMs - a.fileStat.mtimeMs || comparePaths(a.filePath, b.filePath))
       .slice(0, this.maxSessionFiles)
-    const activeFingerprints = new Set(selected.map((candidate) => candidate.fingerprint))
-    for (const fingerprint of this.metadataCache.keys()) {
-      if (!activeFingerprints.has(fingerprint)) this.metadataCache.delete(fingerprint)
+    if (this.catalogRevision === revision) {
+      const activeFingerprints = new Set(selected.map((candidate) => candidate.fingerprint))
+      for (const fingerprint of this.metadataCache.keys()) {
+        if (!activeFingerprints.has(fingerprint)) this.metadataCache.delete(fingerprint)
+      }
     }
 
     const catalogPromise = this.liveCatalog()
     const metadata = await mapLimit(selected, 6, async (candidate) => {
-      try { return await this.cachedMetadata(candidate) } catch { return null }
+      try { return await this.cachedMetadata(candidate, revision) } catch { return null }
     })
     const catalog = await catalogPromise
     return metadata.map((original) => {
       const item = { ...original }
-      const live = catalog.get(resolve(item.filePath))
+      const live = catalog.get(item.filePath)
       if (live) applyLiveMetadata(item, live)
       return item
     })
   }
 
-  private async cachedMetadata(candidate: SessionFileCandidate): Promise<SessionMetadata> {
+  private async cachedMetadata(candidate: SessionFileCandidate, revision: number): Promise<SessionMetadata> {
     const cached = this.metadataCache.get(candidate.fingerprint)
     if (cached) return { ...cached }
     const inFlight = this.metadataRequests.get(candidate.fingerprint)
@@ -99,7 +108,8 @@ export class SessionMetadataCatalog {
     try {
       const metadata = await request
       const current = await stat(candidate.filePath)
-      if (current.mtimeMs === candidate.fileStat.mtimeMs && current.size === candidate.fileStat.size) {
+      if (this.catalogRevision === revision
+        && current.mtimeMs === candidate.fileStat.mtimeMs && current.size === candidate.fileStat.size) {
         this.metadataCache.set(candidate.fingerprint, metadata)
       }
       return { ...metadata }
@@ -110,24 +120,41 @@ export class SessionMetadataCatalog {
 
   private async liveCatalog(): Promise<Map<string, JsonRecord>> {
     if (!this.primeAgentPath) return new Map()
-    if (this.catalogCache && this.catalogCache.expiresAt > Date.now()) return this.catalogCache.sessions
-    if (this.catalogRequest) return this.catalogRequest
-    this.catalogRequest = (async () => {
-      const sessions = new Map<string, JsonRecord>()
-      try {
-        const result = await runProcess(this.primeAgentPath!, ['list', '--all', '--json'], { timeoutMs: 15_000, maxBytes: 16 * 1024 * 1024 })
-        if (result.code === 0) {
-          const parsed: unknown = JSON.parse(result.stdout)
-          if (isRecord(parsed) && Array.isArray(parsed.sessions)) {
-            for (const raw of parsed.sessions) {
-              if (isRecord(raw) && typeof raw.sessionFile === 'string') sessions.set(resolve(raw.sessionFile), raw)
+    const revision = this.catalogRevision
+    if (this.catalogCache && this.catalogCache.revision === revision && this.catalogCache.expiresAt > Date.now()) {
+      return this.catalogCache.sessions
+    }
+    if (this.catalogRequest?.revision === revision) return this.catalogRequest.promise
+    const request = {
+      revision,
+      promise: (async () => {
+        const sessions = new Map<string, JsonRecord>()
+        try {
+          const result = await runProcess(this.primeAgentPath!, ['list', '--all', '--json'], { timeoutMs: 15_000, maxBytes: 16 * 1024 * 1024 })
+          if (result.code === 0) {
+            const parsed: unknown = JSON.parse(result.stdout)
+            if (isRecord(parsed) && Array.isArray(parsed.sessions)
+              && parsed.sessions.length <= this.maxSessionFiles * 4) {
+              await mapLimit(parsed.sessions, 32, async (raw) => {
+                if (!isRecord(raw) || typeof raw.sessionFile !== 'string'
+                  || raw.sessionFile.length > 4_096 || !isAbsolute(raw.sessionFile)) return null
+                try {
+                  sessions.set(await realpath(raw.sessionFile), raw)
+                  return true
+                } catch { return null }
+              })
             }
           }
+        } catch { /* JSONL remains authoritative when the live catalog is unavailable. */ }
+        if (this.catalogRevision === revision) {
+          this.catalogCache = { expiresAt: Date.now() + 2_000, revision, sessions }
         }
-      } catch { /* JSONL remains authoritative when the live catalog is unavailable. */ }
-      this.catalogCache = { expiresAt: Date.now() + 2_000, sessions }
-      return sessions
-    })()
-    try { return await this.catalogRequest } finally { this.catalogRequest = null }
+        return sessions
+      })(),
+    }
+    this.catalogRequest = request
+    try { return await request.promise } finally {
+      if (this.catalogRequest === request) this.catalogRequest = null
+    }
   }
 }

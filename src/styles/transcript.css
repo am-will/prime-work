@@ -1,5 +1,8 @@
 /* Transcript */
 .transcript { position: absolute; inset: 0; overflow-y: auto; padding: 30px 0 170px; }
+.transcript.has-pinned-changes { padding-bottom: 245px; }
+.transcript-changes-pin { position: absolute; z-index: 9; left: 24px; right: 24px; bottom: 137px; width: min(calc(100% - 48px), 760px); margin: 0 auto; }
+.transcript-changes-pin .changes-card { margin: 0; box-shadow: 0 4px 18px color-mix(in srgb, #000 12%, transparent); }
 .transcript__inner { width: min(100%, 760px); min-height: 100%; margin: 0 auto; padding: 0 24px; }
 .transcript__show-earlier { min-height: 30px; display: block; margin: 16px auto 26px; padding: 0 11px; border: 1px solid var(--border); border-radius: 7px; color: var(--text-secondary); background: var(--surface-raised); font-size: 11px; }
 .transcript__show-earlier:hover { color: var(--text); background: var(--surface-hover); }

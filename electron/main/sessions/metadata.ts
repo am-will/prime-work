@@ -36,7 +36,13 @@ export function applyLiveMetadata(metadata: SessionMetadata, live: JsonRecord): 
   if (typeof live.sessionName === 'string' && live.sessionName.trim()) metadata.title = compactText(live.sessionName, 100)
   if (typeof live.thinkingLevel === 'string') metadata.thinkingLevel = live.thinkingLevel
   if (typeof live.rlmDepth === 'number' && Number.isInteger(live.rlmDepth) && live.rlmDepth >= 0) metadata.depth = live.rlmDepth
-  if (typeof live.modified === 'string' && Number.isFinite(Date.parse(live.modified))) metadata.updatedAt = new Date(live.modified).toISOString()
+  if (typeof live.modified === 'string') {
+    const liveModified = Date.parse(live.modified)
+    const jsonlModified = Date.parse(metadata.updatedAt)
+    if (Number.isFinite(liveModified) && (!Number.isFinite(jsonlModified) || liveModified > jsonlModified)) {
+      metadata.updatedAt = new Date(liveModified).toISOString()
+    }
+  }
   if (isRecord(live.model)) {
     if (typeof live.model.id === 'string') metadata.model = live.model.id
     if (typeof live.model.provider === 'string') metadata.provider = live.model.provider

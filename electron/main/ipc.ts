@@ -41,7 +41,7 @@ export interface IpcRegistration {
 }
 
 export function registerIpc(services: Services, expectedRendererUrl: string): IpcRegistration {
-  const authorized = new Set<number>()
+  const authorized = new Map<number, WebContents>()
   const invokeChannels: string[] = []
   const eventChannels: string[] = []
   let closed = false
@@ -92,6 +92,7 @@ export function registerIpc(services: Services, expectedRendererUrl: string): Ip
 
   handle('sessions:list', (_event, projectPath, includeArchived) => services.sessions.list(projectPath as string | undefined, includeArchived))
   handle('sessions:read', (_event, filePath) => services.sessions.read(filePath as string))
+  handle('sessions:follow-up', (_event, filePath, message) => services.sessions.followUp(filePath as string, message as string))
   handle('sessions:rename', (_event, filePath, title) => services.sessions.rename(filePath as string, title as string))
   handle('sessions:archive', (_event, filePath, archived) => services.sessions.archive(filePath as string, archived))
 
@@ -125,13 +126,22 @@ export function registerIpc(services: Services, expectedRendererUrl: string): Ip
   handle('schedules:add', (_event, runtimeId, schedule, prompt) => services.schedules.add(runtimeId, schedule, prompt))
   handle('schedules:cancel', (_event, runtimeId, jobId) => services.schedules.cancel(runtimeId, jobId))
 
+  const unsubscribeSessionChanges = services.sessions.onDidChange((change) => {
+    for (const [id, contents] of authorized) {
+      if (contents.isDestroyed()) { authorized.delete(id); continue }
+      if (isTrustedRendererUrl(contents.getURL(), expectedRendererUrl)
+        && isTrustedRendererUrl(contents.mainFrame.url, expectedRendererUrl)) contents.send('sessions:changed', change)
+    }
+  })
+
   return {
-    authorize(webContents) { if (!closed) authorized.add(webContents.id) },
+    authorize(webContents) { if (!closed) authorized.set(webContents.id, webContents) },
     revoke(webContentsId) { authorized.delete(webContentsId); services.terminals.killOwner(webContentsId) },
     dispose() {
       if (closed) return
       closed = true
       authorized.clear()
+      unsubscribeSessionChanges()
       for (const channel of invokeChannels) ipcMain.removeHandler(channel)
       // Event listeners are removed wholesale only for our private fixed channels.
       for (const channel of eventChannels) ipcMain.removeAllListeners(channel)

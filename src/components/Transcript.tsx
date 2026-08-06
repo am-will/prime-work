@@ -104,7 +104,7 @@ function ThinkingDots({ labelled = false }: { labelled?: boolean }) {
   )
 }
 
-function ToolPart({ part, next }: { part: Extract<MessagePart, { type: 'toolCall' }>; next?: MessagePart }) {
+function ToolPart({ part, next, active }: { part: Extract<MessagePart, { type: 'toolCall' }>; next?: MessagePart; active: boolean }) {
   const [open, setOpen] = useState(false)
   const result = next?.type === 'toolResult' ? next : undefined
   const failed = result?.isError
@@ -113,17 +113,18 @@ function ToolPart({ part, next }: { part: Extract<MessagePart, { type: 'toolCall
   const output = result?.text ?? ''
   const visibleOutput = boundText(`${args}${args && output ? '\n\n' : ''}${output}`, 200_000, '\n\n[Output truncated in the desktop view.]')
   const canExpand = Boolean(visibleOutput)
+  const expanded = canExpand && (active || open)
   const state = failed ? 'error' : result ? 'done' : kind === 'question' ? 'waiting' : 'running'
   return (
     <div className={`activity-line activity-line--tool activity-line--${kind} is-${state}`}>
-      <button type="button" className="activity-tool__summary" disabled={!canExpand} onClick={() => setOpen((value) => !value)} aria-expanded={canExpand ? open : undefined}>
+      <button type="button" className="activity-tool__summary" disabled={!canExpand} onClick={() => { if (!active) setOpen((value) => !value) }} aria-expanded={canExpand ? expanded : undefined}>
         <span className="activity-line__icon">{toolIcon(kind)}</span>
         <span className="activity-line__kind">{kind === 'question' ? 'Question' : part.name}</span>
         {toolPreview(part) ? <code className="activity-tool__preview"><SyntaxText text={toolPreview(part)} /></code> : null}
         <span className="activity-tool__state">{failed ? <><CircleAlert size={12} /> failed</> : result ? <><Check size={12} /> done</> : kind === 'question' ? 'needs input' : <><LoaderCircle className="spin" size={12} /> running</>}</span>
-        {canExpand ? open ? <ChevronDown size={13} /> : <ChevronRight size={13} /> : null}
+        {canExpand ? expanded ? <ChevronDown size={13} /> : <ChevronRight size={13} /> : null}
       </button>
-      {open && visibleOutput ? <pre className="activity-tool__details"><SyntaxText text={visibleOutput} /></pre> : null}
+      {expanded && visibleOutput ? <pre className="activity-tool__details"><SyntaxText text={visibleOutput} /></pre> : null}
     </div>
   )
 }
@@ -132,7 +133,7 @@ function StandaloneToolResult({ part }: { part: Extract<MessagePart, { type: 'to
   return <div className={`activity-line activity-line--result ${part.isError ? 'is-error' : ''}`}><span className="activity-line__icon">{part.isError ? <CircleAlert size={13} /> : <Check size={13} />}</span><span>{boundText(part.text, 2_000, '…')}</span></div>
 }
 
-function WorkTimeline({ parts, showReasoning, showTools }: { parts: MessagePart[]; showReasoning: boolean; showTools: boolean }) {
+function WorkTimeline({ parts, showReasoning, showTools, active }: { parts: MessagePart[]; showReasoning: boolean; showTools: boolean; active: boolean }) {
   const pairedResults = new Set<number>()
   return <div className="work-timeline">{parts.map((part, index) => {
     if (part.type === 'toolResult' && pairedResults.has(index)) return null
@@ -141,7 +142,7 @@ function WorkTimeline({ parts, showReasoning, showTools }: { parts: MessagePart[
       if (!showTools) return null
       const next = parts[index + 1]
       if (next?.type === 'toolResult') pairedResults.add(index + 1)
-      return <ToolPart key={part.id ?? index} part={part} next={next} />
+      return <ToolPart key={part.id ?? index} part={part} next={next} active={active} />
     }
     if (part.type === 'toolResult') return showTools ? <StandaloneToolResult key={index} part={part} /> : null
     if (part.type === 'text') return <div className="activity-line activity-line--note" key={index}><MarkdownText text={part.text} /></div>
@@ -149,13 +150,13 @@ function WorkTimeline({ parts, showReasoning, showTools }: { parts: MessagePart[
   })}</div>
 }
 
-function WorkDisclosure({ message, parts, showReasoning, showTools }: { message: TranscriptMessage; parts: MessagePart[]; showReasoning: boolean; showTools: boolean }) {
+function WorkDisclosure({ message, parts, showReasoning, showTools, active }: { message: TranscriptMessage; parts: MessagePart[]; showReasoning: boolean; showTools: boolean; active: boolean }) {
   const [open, setOpen] = useState(false)
 
-  if (message.streaming) {
+  if (message.streaming || active) {
     return (
       <section className="work-disclosure is-running" aria-label="Prime work activity">
-        <WorkTimeline parts={parts} showReasoning={showReasoning} showTools={showTools} />
+        <WorkTimeline parts={parts} showReasoning={showReasoning} showTools={showTools} active />
         <div className="work-disclosure__thinking"><ThinkingDots labelled /></div>
       </section>
     )
@@ -170,7 +171,7 @@ function WorkDisclosure({ message, parts, showReasoning, showTools }: { message:
         {open ? <ChevronDown size={13} /> : <ChevronRight size={13} />}
         <span>Worked for {duration}</span>
       </button>
-      {open ? <WorkTimeline parts={parts} showReasoning={showReasoning} showTools={showTools} /> : null}
+      {open ? <WorkTimeline parts={parts} showReasoning={showReasoning} showTools={showTools} active={false} /> : null}
     </section>
   )
 }
@@ -252,7 +253,7 @@ function MessageActions({ message, text: suppliedText }: { message: TranscriptMe
   )
 }
 
-const AssistantMessage = memo(function AssistantMessage({ message, git, isLast, showReasoning, showTools, onOpenChanges }: { message: TranscriptMessage; git: GitStatus; isLast: boolean; showReasoning: boolean; showTools: boolean; onOpenChanges(): void }) {
+const AssistantMessage = memo(function AssistantMessage({ message, active, showReasoning, showTools }: { message: TranscriptMessage; active: boolean; showReasoning: boolean; showTools: boolean }) {
   const firstActivity = message.parts.findIndex((part) => part.type === 'thinking' || part.type === 'toolCall' || part.type === 'toolResult')
   let lastActivity = -1
   for (let index = message.parts.length - 1; index >= 0; index -= 1) {
@@ -270,15 +271,14 @@ const AssistantMessage = memo(function AssistantMessage({ message, git, isLast, 
       <div className="assistant-mark"><PrimeMark size={24} /></div>
       <div className="message__content">
         {renderNarrative(before, 'before')}
-        {hasVisibleActivity ? <WorkDisclosure message={message} parts={work} showReasoning={showReasoning} showTools={showTools} /> : renderNarrative(hiddenMiddleNarrative, 'middle')}
+        {hasVisibleActivity ? <WorkDisclosure message={message} parts={work} showReasoning={showReasoning} showTools={showTools} active={active} /> : renderNarrative(hiddenMiddleNarrative, 'middle')}
         {renderNarrative(after, 'after')}
-        {isLast && git.files.length > 0 && !message.streaming ? <ChangesCard git={git} onOpenChanges={onOpenChanges} /> : null}
-        {message.streaming && !hasVisibleActivity ? <div className="streaming-state" aria-live="polite"><ThinkingDots /> Prime is working</div> : null}
-        {!message.streaming ? <MessageActions message={message} text={copyableText} /> : null}
+        {(message.streaming || active) && !hasVisibleActivity ? <div className="streaming-state" aria-live="polite"><ThinkingDots /> Prime is working</div> : null}
+        {!message.streaming && !active ? <MessageActions message={message} text={copyableText} /> : null}
       </div>
     </article>
   )
-}, (previous, next) => previous.message === next.message && previous.isLast === next.isLast && previous.showReasoning === next.showReasoning && previous.showTools === next.showTools && (!next.isLast || previous.git === next.git && previous.onOpenChanges === next.onOpenChanges))
+}, (previous, next) => previous.message === next.message && previous.active === next.active && previous.showReasoning === next.showReasoning && previous.showTools === next.showTools)
 
 const UserMessage = memo(function UserMessage({ message }: { message: TranscriptMessage }) {
   return <article className="message message--user"><div className="user-bubble">{message.parts.map((part, partIndex) => part.type === 'text' ? <InlineText key={partIndex} text={part.text} /> : null)}</div><MessageActions message={message} /></article>
@@ -322,6 +322,7 @@ interface TranscriptProps {
   messages: TranscriptMessage[]
   git: GitStatus
   loading?: boolean
+  active?: boolean
   showReasoning?: boolean
   showTools?: boolean
   onOpenChanges(): void
@@ -329,20 +330,17 @@ interface TranscriptProps {
   suggestionsDisabled?: boolean
 }
 
-export function Transcript({ messages, git, loading, showReasoning = true, showTools = true, onOpenChanges, onSuggestion, suggestionsDisabled }: TranscriptProps) {
+export function Transcript({ messages, git, loading, active = false, showReasoning = true, showTools = true, onOpenChanges, onSuggestion, suggestionsDisabled }: TranscriptProps) {
   const scrollRef = useRef<HTMLDivElement>(null)
   const previousCountRef = useRef(0)
   const previousStreamingRef = useRef(false)
   const pinnedToBottomRef = useRef(true)
   const [visibleLimit, setVisibleLimit] = useState(250)
   const [announcement, setAnnouncement] = useState('')
-  const streaming = messages.some((message) => message.streaming)
+  const streaming = active || messages.some((message) => message.streaming)
   const visibleMessages = useMemo(() => newestWindow(messages, visibleLimit), [messages, visibleLimit])
   const hiddenCount = messages.length - visibleMessages.length
-  const lastAssistantId = useMemo(() => {
-    for (let index = messages.length - 1; index >= 0; index -= 1) if (messages[index].role === 'assistant') return messages[index].id
-    return undefined
-  }, [messages])
+  const activeAssistantId = active && messages.at(-1)?.role === 'assistant' ? messages.at(-1)?.id : undefined
 
   useEffect(() => {
     const firstLoadedTranscript = previousCountRef.current === 0 && messages.length > 0
@@ -365,7 +363,8 @@ export function Transcript({ messages, git, loading, showReasoning = true, showT
   }
 
   return (
-    <div ref={scrollRef} className="transcript scroll-area" aria-busy={loading} onScroll={updatePinnedState}>
+    <>
+    <div ref={scrollRef} className={`transcript scroll-area ${git.files.length ? 'has-pinned-changes' : ''}`} aria-busy={loading} onScroll={updatePinnedState}>
       <div className="sr-only" role="status" aria-live="polite">{announcement}</div>
       <div className="transcript__inner">
         {loading ? <div className="transcript-loading"><LoaderCircle className="spin" size={16} /> Loading session…</div> : null}
@@ -381,7 +380,7 @@ export function Transcript({ messages, git, loading, showReasoning = true, showT
         {visibleMessages.map((message) => message.role === 'user' ? (
           <UserMessage key={message.id} message={message} />
         ) : message.role === 'assistant' ? (
-          <AssistantMessage key={message.id} message={message} git={git} isLast={message.id === lastAssistantId} showReasoning={showReasoning} showTools={showTools} onOpenChanges={onOpenChanges} />
+          <AssistantMessage key={message.id} message={message} active={message.id === activeAssistantId} showReasoning={showReasoning} showTools={showTools} />
         ) : message.role === 'agent' ? (
           <AgentMessage key={message.id} message={message} />
         ) : message.role === 'goal' ? (
@@ -389,8 +388,16 @@ export function Transcript({ messages, git, loading, showReasoning = true, showT
         ) : (
           <div className={`message message--${message.role}`} key={message.id}>{message.parts.map((part, partIndex) => part.type === 'text' ? <span key={partIndex}>{part.text}</span> : null)}</div>
         ))}
+        {active && !activeAssistantId ? (
+          <article className="message message--assistant transcript-active-placeholder" aria-live="polite">
+            <div className="assistant-mark"><PrimeMark size={24} /></div>
+            <div className="streaming-state"><ThinkingDots /> Prime is working</div>
+          </article>
+        ) : null}
         <div />
       </div>
     </div>
+    {git.files.length ? <div className="transcript-changes-pin"><ChangesCard git={git} onOpenChanges={onOpenChanges} /></div> : null}
+    </>
   )
 }
